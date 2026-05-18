@@ -2,11 +2,14 @@ require('dotenv').config();
 
 const fs = require('node:fs');
 const path = require('node:path');
+const sharp = require('sharp');
 const {
+  AttachmentBuilder,
   ChannelType,
   Client,
   EmbedBuilder,
   GatewayIntentBits,
+  MessageFlags,
   Partials,
   PermissionsBitField,
   SlashCommandBuilder,
@@ -40,7 +43,59 @@ const AI_REASONING = {
   exclude: true,
 };
 const DISCORD_MESSAGE_LIMIT = 2000;
-const FACEBOOK_FIX_HOST = 'fixacebook.com';
+const FACEBOOK_FIX_HOST = process.env.FACEBOOK_FIX_HOST || 'fixacebook.com';
+const FACEBOOK_EMBED_CHECK_DELAY_MS = 12_000;
+const SCRAM_ALLOWED_USER_IDS = (process.env.SCRAM_ALLOWED_USER_IDS || '')
+  .split(',')
+  .map((userId) => userId.trim())
+  .filter(Boolean);
+const SCRAM_WRONG_GUESSES_PER_HINT = 3;
+const SCRAM_MIN_WORD_LENGTH = 2;
+const SCRAM_MAX_WORD_LENGTH = 30;
+const SCRAM_MIN_DIFFICULTY = 1;
+const SCRAM_MAX_DIFFICULTY = 10;
+const SCRAM_GRID_COLUMNS = 10;
+const SCRAM_MIN_GRID_LETTERS = 10;
+const SCRAM_DEFAULT_LETTERBANK_SIZE = 20;
+const SCRAM_MAX_LETTERBANK_SIZE = 100;
+const SCRAM_COMMAND_ACK_DELETE_MS = 2_000;
+const WORD_COLLAGE_THREAD_ID = '1501594716943159308';
+const WORD_COLLAGE_SESSION_MS = 5 * 60 * 1000;
+const WORD_COLLAGE_IMAGE_COUNT = 4;
+const WORD_COLLAGE_SIZE = 1080;
+const WORD_COLLAGE_BACKGROUNDS = [
+  '#78db57',
+  '#4fd1c5',
+  '#f59e0b',
+  '#f472b6',
+  '#60a5fa',
+  '#a3e635',
+];
+const WORD_COLLAGE_GRADIENTS = [
+  ['#78db57', '#4fd1c5'],
+  ['#f97316', '#facc15'],
+  ['#60a5fa', '#f472b6'],
+  ['#a3e635', '#22c55e'],
+  ['#f43f5e', '#fb7185'],
+];
+const WORD_COLLAGE_TILE_SIZE = 492;
+const WORD_COLLAGE_TILE_RADIUS = 38;
+const WORD_COLLAGE_TILE_BORDER = 7;
+const WORD_COLLAGE_TILE_SHADOW_OFFSET = 9;
+const WORD_COLLAGE_TILE_POSITIONS = [
+  { left: 31, top: 31 },
+  { left: 556, top: 31 },
+  { left: 31, top: 556 },
+  { left: 556, top: 556 },
+];
+const SIX_SEVEN_RESPONSE = 'DID SOMEONE SAY 67??!?!?';
+const SIX_SEVEN_PATTERNS = [
+  /\b67\b/i,
+  /\b6\s*(?:[*x×]|times|by|and)?\s*7\b/i,
+  /\bsix\s*(?:[*x×]|times|by|and)?\s*seven\b/i,
+  /\bsixty[-\s]?seven\b/i,
+  /\broku[-\s]?nana\b/i,
+];
 const runtimeStats = {
   liveMessagesSeen: 0,
   liveMessagesWithContent: 0,
@@ -118,6 +173,37 @@ const commands = [
   new SlashCommandBuilder()
     .setName('nsettings')
     .setDescription('Show word counter settings for this server.'),
+  new SlashCommandBuilder()
+    .setName('nscram')
+    .setDescription('Queue an image word scramble game.')
+    .addStringOption((option) =>
+      option
+        .setName('word')
+        .setDescription('The word people need to guess.')
+        .setRequired(true),
+    )
+    .addAttachmentOption((option) =>
+      option
+        .setName('image')
+        .setDescription('Edited puzzle image.')
+        .setRequired(true),
+    )
+    .addIntegerOption((option) =>
+      option
+        .setName('difficulty')
+        .setDescription('Difficulty rating from 1 to 10.')
+        .setMinValue(SCRAM_MIN_DIFFICULTY)
+        .setMaxValue(SCRAM_MAX_DIFFICULTY)
+        .setRequired(true),
+    )
+    .addIntegerOption((option) =>
+      option
+        .setName('letterbank')
+        .setDescription('Total letters to show in the letter bank. Defaults to 20.')
+        .setMinValue(SCRAM_MIN_GRID_LETTERS)
+        .setMaxValue(SCRAM_MAX_LETTERBANK_SIZE)
+        .setRequired(false),
+    ),
 ].map((command) => command.toJSON());
 
 const globalCommands = [
@@ -129,6 +215,10 @@ const globalCommands = [
 let data = loadData();
 let saveTimer = null;
 const activeSyncs = new Set();
+const wordCollageSessions = new Map();
+const scramGames = new Map();
+const scramQueues = new Map();
+const scramActiveThreadsByChannel = new Map();
 
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
@@ -155,6 +245,16 @@ client.on('messageCreate', async (message) => {
   if (counted) {
     await maybeSendStreakUpdate(message);
   }
+
+  if (await handleWordCollageImageMessage(message)) {
+    return;
+  }
+
+  if (await handleScramGuess(message)) {
+    return;
+  }
+
+  await maybeSendSixSevenCallout(message);
 
   const handledPrefixCommand = await handlePrefixCommand(message);
   if (!handledPrefixCommand) {
@@ -192,7 +292,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (!interaction.guildId) {
-      await interaction.reply({ content: 'That command only works in a server.', ephemeral: true });
+      await interaction.reply({ content: 'That command only works in a server.', flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -228,15 +328,20 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.commandName === 'nsettings') {
       await handleSettings(interaction);
+      return;
+    }
+
+    if (interaction.commandName === 'nscram') {
+      await handleScramStart(interaction);
     }
   } catch (error) {
     console.error(error);
     const content = 'Something went wrong while running that command.';
 
     if (interaction.deferred || interaction.replied) {
-      await interaction.followUp({ content, ephemeral: true }).catch(() => {});
+      await interaction.followUp({ content, flags: MessageFlags.Ephemeral }).catch(() => {});
     } else {
-      await interaction.reply({ content, ephemeral: true }).catch(() => {});
+      await interaction.reply({ content, flags: MessageFlags.Ephemeral }).catch(() => {});
     }
   }
 });
@@ -463,6 +568,629 @@ async function maybeSendStreakUpdate(message) {
   });
 }
 
+async function maybeSendSixSevenCallout(message) {
+  if (!isSixSevenMessage(message.content || '')) return;
+
+  await message.channel.send(SIX_SEVEN_RESPONSE).catch((error) => {
+    console.error('Could not send 67 callout:', error.message);
+  });
+}
+
+function isSixSevenMessage(content) {
+  return SIX_SEVEN_PATTERNS.some((pattern) => pattern.test(content));
+}
+
+async function handleScramStart(interaction) {
+  if (!isScramAllowedUser(interaction.user.id)) {
+    await interaction.reply({
+      content: SCRAM_ALLOWED_USER_IDS.length
+        ? 'You are not allowed to start scramble games.'
+        : 'SCRAM_ALLOWED_USER_IDS is not configured.',
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (!isScramParentChannel(interaction.channel)) {
+    await interaction.reply({
+      content: 'This command only works in a text or announcement channel.',
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const missingPermissions = await getMissingScramPermissions(interaction);
+  if (missingPermissions.length) {
+    await interaction.reply({
+      content: `I cannot start scramble games here. Missing permission(s): ${missingPermissions.join(', ')}.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const rawWord = interaction.options.getString('word', true);
+  const answer = normalizeScramAnswer(rawWord);
+  if (answer.length < SCRAM_MIN_WORD_LENGTH || answer.length > SCRAM_MAX_WORD_LENGTH) {
+    await interaction.reply({
+      content: `Use a word from ${SCRAM_MIN_WORD_LENGTH}-${SCRAM_MAX_WORD_LENGTH} letters/numbers.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const imageUrl = getScramImageUrl(interaction);
+  if (!imageUrl) {
+    await interaction.reply({
+      content: 'Attach one normal image file.',
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const letterBankSize = interaction.options.getInteger('letterbank') || SCRAM_DEFAULT_LETTERBANK_SIZE;
+  const difficulty = interaction.options.getInteger('difficulty', true);
+  const puzzle = {
+    parentChannelId: interaction.channelId,
+    answer,
+    displayWord: answer.toUpperCase(),
+    imageUrl,
+    difficulty,
+    letterBankSize,
+  };
+  const queue = getScramQueue(interaction.channelId);
+  const wasIdle = !scramActiveThreadsByChannel.has(interaction.channelId) && queue.length === 0;
+
+  queue.push(puzzle);
+
+  await interaction.reply({
+    content: wasIdle
+      ? 'Starting scramble puzzle.'
+      : `Queued scramble puzzle. Queue size: ${queue.length}.`,
+    flags: MessageFlags.Ephemeral,
+  });
+
+  if (wasIdle) {
+    await startNextScramPuzzle(interaction.channel);
+  }
+
+  scheduleInteractionReplyDelete(interaction);
+}
+
+async function startNextScramPuzzle(channel) {
+  if (!channel || scramActiveThreadsByChannel.has(channel.id)) return;
+
+  const queue = getScramQueue(channel.id);
+  const puzzle = queue.shift();
+  if (!puzzle) return;
+
+  const game = {
+    ...puzzle,
+    revealedIndexes: new Set([0]),
+    nextHintFromEnd: true,
+    wrongGuesses: 0,
+    gridLetters: buildScramGridLetters(puzzle.answer, puzzle.letterBankSize),
+    message: null,
+    puzzleMessage: null,
+    thread: null,
+  };
+
+  const gameMessage = await channel.send({
+    content: `Difficulty ${game.difficulty}/10`,
+    embeds: [buildScramImageEmbed(game.imageUrl)],
+    allowedMentions: { parse: [] },
+  }).catch((error) => {
+    console.error('Could not start scramble puzzle:', error.message);
+    return null;
+  });
+
+  if (!gameMessage) return;
+
+  const thread = await createScramThread(channel, gameMessage);
+
+  if (!thread) {
+    await gameMessage.edit({
+      content: `Difficulty ${game.difficulty}/10\nCould not create the guess thread. Check bot thread permissions.`,
+      embeds: [buildScramImageEmbed(game.imageUrl)],
+    }).catch(() => {});
+    return;
+  }
+
+  game.message = gameMessage;
+  game.thread = thread;
+  scramGames.set(thread.id, game);
+  scramActiveThreadsByChannel.set(channel.id, thread.id);
+
+  game.puzzleMessage = await thread.send({
+    content: buildScramMessage(game),
+    allowedMentions: { parse: [] },
+  }).catch((error) => {
+    console.error('Could not send scramble puzzle text:', error.message);
+    return null;
+  });
+}
+
+async function handleScramGuess(message) {
+  const game = scramGames.get(message.channelId);
+  if (!game) return false;
+
+  const guess = getScramGuess(message.content);
+  if (guess === null) return false;
+
+  if (!guess) {
+    await message.reply('Send one word with no spaces to guess.').catch(() => {});
+    return true;
+  }
+
+  if (guess !== game.answer) {
+    game.wrongGuesses += 1;
+    await message.react('❌').catch((error) => {
+      console.error('Could not react to wrong scramble guess:', error.message);
+    });
+
+    if (game.wrongGuesses % SCRAM_WRONG_GUESSES_PER_HINT === 0) {
+      await revealNextScramHint(message.channel);
+    } else {
+      await game.puzzleMessage?.edit({
+        content: buildScramMessage(game),
+      }).catch((error) => {
+        console.error('Could not edit scramble message:', error.message);
+      });
+    }
+
+    return true;
+  }
+
+  clearScramGame(message.channelId);
+  await message.channel.send({
+    content: `Congrats <@${message.author.id}>! The word was **${game.displayWord}**.`,
+    allowedMentions: { users: [message.author.id] },
+  }).catch((error) => {
+    console.error('Could not send scramble winner message:', error.message);
+  });
+  await game.puzzleMessage?.edit({
+    content: `${buildScramMessage({ ...game, revealedIndexes: getAllScramIndexes(game.answer) })}\n\nSolved by <@${message.author.id}>.`,
+  }).catch(() => {});
+  await startNextScramPuzzle(getScramParentChannel(game));
+  return true;
+}
+
+async function revealNextScramHint(channel) {
+  const channelId = channel.id;
+  const game = scramGames.get(channelId);
+  if (!game) return;
+
+  const nextHintIndex = getNextScramHintIndex(game);
+  if (nextHintIndex !== null) {
+    game.revealedIndexes.add(nextHintIndex);
+  }
+
+  if (game.revealedIndexes.size >= game.answer.length) {
+    clearScramGame(channelId);
+    await game.puzzleMessage?.edit({
+      content: `${buildScramMessage(game)}\n\nOut of hints. The word was **${game.displayWord}**.`,
+    }).catch(() => {});
+    await startNextScramPuzzle(getScramParentChannel(game));
+    return;
+  }
+
+  await game.puzzleMessage?.edit({
+    content: buildScramMessage(game),
+  }).catch((error) => {
+    console.error('Could not edit scramble message:', error.message);
+  });
+
+  await channel.send({
+    content: buildScramHintUpdateMessage(game),
+    allowedMentions: { parse: [] },
+  }).catch((error) => {
+    console.error('Could not send scramble hint update:', error.message);
+  });
+}
+
+function clearScramGame(channelId) {
+  const game = scramGames.get(channelId);
+  if (game?.parentChannelId) {
+    scramActiveThreadsByChannel.delete(game.parentChannelId);
+  }
+
+  scramGames.delete(channelId);
+}
+
+function buildScramMessage(game) {
+  const lines = [
+    buildScramHintLine(game.displayWord, game.revealedIndexes),
+    '',
+    buildScramGrid(buildScramGridDisplayLetters(game)),
+  ].join('\n');
+
+  return `\`\`\`\n${lines}\n\`\`\``;
+}
+
+function buildScramHintUpdateMessage(game) {
+  const lines = [
+    buildScramHintLine(game.displayWord, game.revealedIndexes),
+    '',
+    buildScramGrid(buildScramGridDisplayLetters(game)),
+  ].join('\n');
+
+  return `\`\`\`\n${lines}\n\`\`\``;
+}
+
+function buildScramGridDisplayLetters(game) {
+  const revealedLetters = new Set(
+    [...game.revealedIndexes].map((index) => game.displayWord[index]),
+  );
+
+  return game.gridLetters.map((letter) =>
+    revealedLetters.has(letter) ? '_' : letter,
+  );
+}
+
+function buildScramHintLine(displayWord, revealedIndexes) {
+  return displayWord
+    .split('')
+    .map((letter, index) => (revealedIndexes.has(index) ? letter : '_'))
+    .join(' ');
+}
+
+function buildScramGrid(letters) {
+  const rows = [];
+  for (let index = 0; index < letters.length; index += SCRAM_GRID_COLUMNS) {
+    rows.push(letters.slice(index, index + SCRAM_GRID_COLUMNS).join(' '));
+  }
+
+  return rows.join('\n');
+}
+
+function buildScramGridLetters(answer, letterBankSize = SCRAM_DEFAULT_LETTERBANK_SIZE) {
+  const letters = answer.toUpperCase().split('');
+  const requestedSize = Math.max(SCRAM_MIN_GRID_LETTERS, letterBankSize, letters.length);
+  const gridSize = Math.ceil(requestedSize / SCRAM_GRID_COLUMNS) * SCRAM_GRID_COLUMNS;
+
+  while (letters.length < gridSize) {
+    letters.push(getRandomUppercaseLetter());
+  }
+
+  return shuffleArray(letters);
+}
+
+function getNextScramHintIndex(game) {
+  const findIndex = game.nextHintFromEnd ? findLastHiddenScramIndex : findFirstHiddenScramIndex;
+  const fallbackFindIndex = game.nextHintFromEnd ? findFirstHiddenScramIndex : findLastHiddenScramIndex;
+  const index = findIndex(game);
+
+  game.nextHintFromEnd = !game.nextHintFromEnd;
+  return index ?? fallbackFindIndex(game);
+}
+
+function findFirstHiddenScramIndex(game) {
+  for (let index = 0; index < game.answer.length; index += 1) {
+    if (!game.revealedIndexes.has(index)) return index;
+  }
+
+  return null;
+}
+
+function findLastHiddenScramIndex(game) {
+  for (let index = game.answer.length - 1; index >= 0; index -= 1) {
+    if (!game.revealedIndexes.has(index)) return index;
+  }
+
+  return null;
+}
+
+function getAllScramIndexes(answer) {
+  return new Set(answer.split('').map((_, index) => index));
+}
+
+function getScramQueue(channelId) {
+  if (!scramQueues.has(channelId)) {
+    scramQueues.set(channelId, []);
+  }
+
+  return scramQueues.get(channelId);
+}
+
+function getScramImageUrl(interaction) {
+  const attachment = interaction.options.getAttachment('image', true);
+  return isSupportedImageAttachment(attachment) ? attachment.url : null;
+}
+
+function buildScramImageEmbed(imageUrl) {
+  return new EmbedBuilder()
+    .setColor(0x3b82f6)
+    .setImage(imageUrl);
+}
+
+async function createScramThread(channel, message) {
+  const options = {
+    name: 'Word scramble guesses',
+    autoArchiveDuration: 60,
+    reason: 'Word scramble guesses',
+  };
+
+  const thread = await message.startThread(options).catch((error) => {
+    console.error('Could not create scramble thread from message:', error.message);
+    return null;
+  });
+  if (thread) return thread;
+
+  if (typeof channel.threads?.create !== 'function') return null;
+
+  return channel.threads.create({
+    ...options,
+    startMessage: message.id,
+  }).catch((error) => {
+    console.error('Could not create scramble thread from channel:', error.message);
+    return null;
+  });
+}
+
+function getScramParentChannel(game) {
+  return game.thread?.parent || game.message?.channel || null;
+}
+
+function scheduleInteractionReplyDelete(interaction) {
+  setTimeout(() => {
+    interaction.deleteReply().catch(() => {});
+  }, SCRAM_COMMAND_ACK_DELETE_MS);
+}
+
+function getScramGuess(content) {
+  const trimmed = String(content || '').trim();
+  if (!trimmed || /\s/.test(trimmed)) return null;
+
+  return normalizeScramAnswer(trimmed);
+}
+
+function getRandomUppercaseLetter() {
+  return String.fromCharCode(65 + Math.floor(Math.random() * 26));
+}
+
+function shuffleArray(items) {
+  const shuffled = [...items];
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
+  }
+
+  return shuffled;
+}
+
+function normalizeScramAnswer(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function isScramAllowedUser(userId) {
+  return SCRAM_ALLOWED_USER_IDS.includes(userId);
+}
+
+async function getMissingScramPermissions(interaction) {
+  const botMember = interaction.guild.members.me
+    || await interaction.guild.members.fetchMe().catch(() => null);
+  if (!botMember) return ['Read bot member permissions'];
+
+  const permissions = interaction.channel.permissionsFor(botMember);
+  if (!permissions) return ['View Channel'];
+
+  return [
+    [PermissionsBitField.Flags.ViewChannel, 'View Channel'],
+    [PermissionsBitField.Flags.SendMessages, 'Send Messages'],
+    [PermissionsBitField.Flags.EmbedLinks, 'Embed Links'],
+    [PermissionsBitField.Flags.CreatePublicThreads, 'Create Public Threads'],
+    [PermissionsBitField.Flags.SendMessagesInThreads, 'Send Messages in Threads'],
+  ]
+    .filter(([flag]) => !permissions.has(flag))
+    .map(([, label]) => label);
+}
+
+function isScramParentChannel(channel) {
+  return [
+    ChannelType.GuildText,
+    ChannelType.GuildAnnouncement,
+  ].includes(channel?.type);
+}
+
+async function handleWordCollageStart(message) {
+  if (message.channelId !== WORD_COLLAGE_THREAD_ID) {
+    await message.reply(`This only works in <#${WORD_COLLAGE_THREAD_ID}>.`).catch(() => {});
+    return;
+  }
+
+  const sessionKey = getWordCollageSessionKey(message);
+  clearWordCollageSession(sessionKey);
+
+  const session = {
+    userId: message.author.id,
+    channelId: message.channelId,
+    imageUrls: [],
+    timeout: setTimeout(() => {
+      wordCollageSessions.delete(sessionKey);
+    }, WORD_COLLAGE_SESSION_MS),
+  };
+
+  wordCollageSessions.set(sessionKey, session);
+
+  await message.reply('Send 4 images.').catch((error) => {
+    console.error('Could not start word collage session:', error.message);
+  });
+}
+
+async function handleWordCollageImageMessage(message) {
+  if (message.channelId !== WORD_COLLAGE_THREAD_ID) return false;
+
+  const sessionKey = getWordCollageSessionKey(message);
+  const session = wordCollageSessions.get(sessionKey);
+  if (!session) return false;
+
+  const imageUrls = getImageAttachmentUrls(message);
+  if (!imageUrls.length) return false;
+
+  session.imageUrls.push(...imageUrls);
+  session.imageUrls = session.imageUrls.slice(0, WORD_COLLAGE_IMAGE_COUNT);
+
+  if (session.imageUrls.length < WORD_COLLAGE_IMAGE_COUNT) {
+    await message.reply(`Got ${session.imageUrls.length}/4 image(s).`).catch(() => {});
+    return true;
+  }
+
+  clearWordCollageSession(sessionKey);
+
+  await message.channel.sendTyping().catch(() => {});
+
+  try {
+    const collage = await buildWordCollage(session.imageUrls);
+    await message.reply({
+      files: [
+        new AttachmentBuilder(collage, {
+          name: 'nword-collage.png',
+        }),
+      ],
+    });
+  } catch (error) {
+    console.error('Could not build word collage:', error.message);
+    await message.reply('Could not make the image. Try sending 4 normal PNG/JPG/WebP images.').catch(() => {});
+  }
+
+  return true;
+}
+
+function getWordCollageSessionKey(message) {
+  return `${message.channelId}:${message.author.id}`;
+}
+
+function clearWordCollageSession(sessionKey) {
+  const session = wordCollageSessions.get(sessionKey);
+  if (session?.timeout) clearTimeout(session.timeout);
+  wordCollageSessions.delete(sessionKey);
+}
+
+function getImageAttachmentUrls(message) {
+  return [...message.attachments.values()]
+    .filter((attachment) => isSupportedImageAttachment(attachment))
+    .map((attachment) => attachment.url);
+}
+
+function isSupportedImageAttachment(attachment) {
+  return attachment.contentType?.startsWith('image/')
+    || /\.(png|jpe?g|webp|gif)(\?|$)/i.test(attachment.url);
+}
+
+async function buildWordCollage(imageUrls) {
+  const composites = [];
+
+  for (const [index, imageUrl] of imageUrls.entries()) {
+    const position = WORD_COLLAGE_TILE_POSITIONS[index];
+    const tile = await buildWordCollageTile(imageUrl);
+    const shadow = await buildRoundedRectSvg(
+      WORD_COLLAGE_TILE_SIZE,
+      WORD_COLLAGE_TILE_SIZE,
+      WORD_COLLAGE_TILE_RADIUS,
+      '#000000',
+    );
+
+    composites.push({
+      input: shadow,
+      left: position.left + WORD_COLLAGE_TILE_SHADOW_OFFSET,
+      top: position.top + WORD_COLLAGE_TILE_SHADOW_OFFSET,
+    });
+    composites.push({
+      input: tile,
+      left: position.left,
+      top: position.top,
+    });
+  }
+
+  const background = buildRandomWordCollageBackground();
+
+  return sharp(background)
+    .composite(composites)
+    .png()
+    .toBuffer();
+}
+
+function buildRandomWordCollageBackground() {
+  if (Math.random() < 0.45) {
+    const gradient = WORD_COLLAGE_GRADIENTS[Math.floor(Math.random() * WORD_COLLAGE_GRADIENTS.length)];
+    return buildLinearGradientSvg(WORD_COLLAGE_SIZE, WORD_COLLAGE_SIZE, gradient[0], gradient[1]);
+  }
+
+  return {
+    create: {
+      width: WORD_COLLAGE_SIZE,
+      height: WORD_COLLAGE_SIZE,
+      channels: 4,
+      background: WORD_COLLAGE_BACKGROUNDS[Math.floor(Math.random() * WORD_COLLAGE_BACKGROUNDS.length)],
+    },
+  };
+}
+
+async function buildWordCollageTile(imageUrl) {
+  const image = await fetchImageBuffer(imageUrl);
+  const innerSize = WORD_COLLAGE_TILE_SIZE - WORD_COLLAGE_TILE_BORDER * 2;
+  const innerRadius = WORD_COLLAGE_TILE_RADIUS - WORD_COLLAGE_TILE_BORDER;
+  const imageMask = await buildRoundedRectSvg(innerSize, innerSize, innerRadius, '#ffffff');
+  const tileMask = await buildRoundedRectSvg(
+    WORD_COLLAGE_TILE_SIZE,
+    WORD_COLLAGE_TILE_SIZE,
+    WORD_COLLAGE_TILE_RADIUS,
+    '#ffffff',
+  );
+  const imageLayer = await sharp(image)
+    .rotate()
+    .resize(innerSize, innerSize, { fit: 'cover' })
+    .composite([{ input: imageMask, blend: 'dest-in' }])
+    .png()
+    .toBuffer();
+
+  return sharp({
+    create: {
+      width: WORD_COLLAGE_TILE_SIZE,
+      height: WORD_COLLAGE_TILE_SIZE,
+      channels: 4,
+      background: '#000000',
+    },
+  })
+    .composite([
+      {
+        input: imageLayer,
+        left: WORD_COLLAGE_TILE_BORDER,
+        top: WORD_COLLAGE_TILE_BORDER,
+      },
+      {
+        input: tileMask,
+        blend: 'dest-in',
+      },
+    ])
+    .png()
+    .toBuffer();
+}
+
+async function fetchImageBuffer(imageUrl) {
+  const response = await fetch(imageUrl);
+  if (!response.ok) {
+    throw new Error(`Image download failed: ${response.status}`);
+  }
+
+  return Buffer.from(await response.arrayBuffer());
+}
+
+function buildRoundedRectSvg(width, height, radius, fill) {
+  return Buffer.from(
+    `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg"><rect width="${width}" height="${height}" rx="${radius}" ry="${radius}" fill="${fill}"/></svg>`,
+  );
+}
+
+function buildLinearGradientSvg(width, height, startColor, endColor) {
+  const horizontal = Math.random() < 0.5;
+  const endX = horizontal ? '100%' : '0%';
+  const endY = horizontal ? '0%' : '100%';
+
+  return Buffer.from(
+    `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="g" x1="0%" y1="0%" x2="${endX}" y2="${endY}"><stop offset="0%" stop-color="${startColor}"/><stop offset="100%" stop-color="${endColor}"/></linearGradient></defs><rect width="${width}" height="${height}" fill="url(#g)"/></svg>`,
+  );
+}
+
 function startDailyStreakReminder() {
   const delay = getNextDailyStreakReminderDelay();
   setTimeout(() => {
@@ -555,14 +1283,30 @@ async function handleFacebookEmbedFix(message) {
     console.error('Could not suppress Facebook embed:', error.message);
   });
 
-  await message.reply({
+  const replyMessage = await message.reply({
     content: fixedLinks.map(({ label, url }) => `[${label}](${url})`).join('\n'),
     allowedMentions: { repliedUser: false, parse: [] },
   }).catch((error) => {
     console.error('Could not send fixed Facebook embed:', error.message);
+    return null;
   });
 
+  if (replyMessage) {
+    scheduleFacebookEmbedCheck(replyMessage);
+  }
+
   return true;
+}
+
+function scheduleFacebookEmbedCheck(message) {
+  setTimeout(async () => {
+    const fetchedMessage = await message.fetch().catch(() => null);
+    if (!fetchedMessage || fetchedMessage.embeds.length > 0) return;
+
+    await fetchedMessage.edit('Failed to load Facebook video embed.').catch((error) => {
+      console.error('Could not edit failed Facebook embed message:', error.message);
+    });
+  }, FACEBOOK_EMBED_CHECK_DELAY_MS);
 }
 
 function getFixedFacebookLinks(content) {
@@ -604,29 +1348,18 @@ function fixFacebookUrl(rawUrl) {
 function getFacebookFixLabel(url) {
   const path = url.pathname.toLowerCase();
   if (/^\/reels?\//.test(path) || /^\/share\/r\//.test(path)) return 'Reel';
-  if (/^\/[^/]+\/videos\//.test(path) || path === '/watch/' || /^\/share\/v\//.test(path)) return 'Video';
-  return 'Post';
+  if (/^\/share\/v\//.test(path)) return 'Video';
+  return 'Facebook';
 }
 
 function isSupportedFacebookEmbedPath(url) {
   const path = url.pathname.toLowerCase();
   return [
-    /^\/[^/]+\/posts\/[^/]+\/?$/,
-    /^\/[^/]+\/videos\/[^/]+\/?$/,
     /^\/reel\/[^/]+\/?$/,
     /^\/reels\/[^/]+\/?$/,
-    /^\/share\/[prv]\/[^/]+\/?$/,
-    /^\/groups\/[^/]+\/posts\/[^/]+\/?$/,
-  ].some((pattern) => pattern.test(path)) || (
-    path === '/watch/'
-    && url.searchParams.has('v')
-  ) || (
-    path === '/permalink.php'
-    && url.searchParams.has('story_fbid')
-  ) || (
-    path === '/story.php'
-    && url.searchParams.has('story_fbid')
-  );
+    /^\/share\/r\/[^/]+\/?$/,
+    /^\/share\/v\/[^/]+\/?$/,
+  ].some((pattern) => pattern.test(path));
 }
 
 async function handlePrefixCommand(message) {
@@ -669,6 +1402,11 @@ async function handlePrefixCommand(message) {
 
   if (command === 'debug') {
     await message.reply(buildDebugText(message.guildId)).catch(() => {});
+    return true;
+  }
+
+  if (command === 'word') {
+    await handleWordCollageStart(message);
     return true;
   }
 
